@@ -1,0 +1,151 @@
+services:
+  # 1. Base de Datos (PostgreSQL)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cipheraudit-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - ciphernet
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # 2. Broker de Mensajería (RabbitMQ)
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: cipheraudit-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+    ports:
+      - "127.0.0.1:15672:15672" # Management UI solo local
+      - "5672:5672" # Puerto AMQP
+    networks:
+      - ciphernet
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # 3. Microservicio C# (Productor)
+  csharp-producer:
+    build: ./services/csharp-producer
+    container_name: cipheraudit-csharp
+    environment:
+      ASPNETCORE_URLS: "http://+:8080"
+      ASPNETCORE_ENVIRONMENT: "Production"
+      DB_HOST: "postgres"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      RMQ_HOST: "rabbitmq"
+      RMQ_USER: ${RABBITMQ_DEFAULT_USER}
+      RMQ_PASS: ${RABBITMQ_DEFAULT_PASS}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+    ports:
+      - "8080:8080"  # ✅ AGREGAR ESTA LÍNEA
+    networks:
+      - ciphernet
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # 4. Java BFF (Consumidor)
+  java-bff:
+    build: ./services/java-bff
+    container_name: cipheraudit-java
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: "postgres"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      RMQ_HOST: "rabbitmq"
+      RMQ_USER: ${RABBITMQ_DEFAULT_USER}
+      RMQ_PASS: ${RABBITMQ_DEFAULT_PASS}
+    command: >
+      sh -c "
+      until nc -z rabbitmq 5672 && nc -z postgres 5432; 
+      do echo 'Esperando a RabbitMQ y Postgres...'; sleep 3; 
+      done;
+      java -jar /app/app.jar"
+    networks:
+      - ciphernet
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # 5. Frontend React
+  sentinel-front:
+    build: 
+      context: ./services/sentinel-front
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+    container_name: cipheraudit-frontend
+    networks:
+      - ciphernet
+    depends_on:
+      java-bff:
+        condition: service_healthy
+
+  # 6. API Gateway (Kong Declarativo)
+  kong:
+    image: kong:3.6.0
+    container_name: cipheraudit-kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001
+      KONG_LOG_LEVEL: debug
+    volumes:
+      - ./infra/kong/declarative:/kong/declarative
+    ports:
+      - "80:8000"
+    networks:
+      - ciphernet
+    depends_on:
+      csharp-producer:
+        condition: service_healthy
+      sentinel-front:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+networks:
+  ciphernet:
+    driver: bridge
+
+volumes:
+  postgres_data:
